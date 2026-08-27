@@ -1,21 +1,15 @@
 #include "l3s/Engine.hpp"
 #include "l3s/Simulator.hpp"
+#include "l3s/Telemetry.hpp"
 
 #include <zmq.hpp>
 
 #include <chrono>
-#include <cstring>
 #include <iostream>
 #include <thread>
 #include <vector>
 
 constexpr int kPublishIntervalMs = 500;
-
-static void sendField(zmq::socket_t& pub, const std::vector<float>& field, bool more) {
-    zmq::message_t msg(field.size() * sizeof(float));
-    std::memcpy(msg.data(), field.data(), msg.size());
-    pub.send(msg, more ? zmq::send_flags::sndmore : zmq::send_flags::none);
-}
 
 int main() {
     zmq::context_t ctx(1);
@@ -28,9 +22,13 @@ int main() {
 
     l3s::SimulatorConfig cfg;
     l3s::Simulator sim(cfg);
+    l3s::TelemetryPublisher telemetry(pub);
 
     double t = 0.0;
+    uint32_t frameIndex = 0;
     while (true) {
+        const auto tComputeStart = std::chrono::steady_clock::now();
+
         const auto overpasses = sim.generateOverpasses(t);
 
         // LVZA is computed on the raw, undebiased overpasses -- it's the
@@ -49,16 +47,32 @@ int main() {
         }
         const auto fused = l3s::buildWeightedComposite(debiased, weights, cfg.width, cfg.height);
 
-        // Wire layout unchanged: one part per RAW overpass (not the
-        // debiased copy), then LVZA, then the fused composite.
-        for (size_t k = 0; k < overpasses.size(); ++k) {
-            sendField(pub, overpasses[k].sst, true);
-        }
-        sendField(pub, lvza, true);
-        sendField(pub, fused, false);
+        const auto tComputeEnd = std::chrono::steady_clock::now();
+        const double execMs = std::chrono::duration<double, std::milli>(tComputeEnd - tComputeStart).count();
 
-        std::cout << "published " << overpasses.size() << " overpasses + lvza + fused  t=" << t << "\n";
+        std::vector<std::vector<float>> rawOverpasses;
+        rawOverpasses.reserve(overpasses.size());
+        for (const auto& op : overpasses) rawOverpasses.push_back(op.sst);
 
+        const size_t totalFieldBytes =
+            (rawOverpasses.size() + 2) * static_cast<size_t>(cfg.width) * cfg.height * sizeof(float);
+        const double throughputMbS = execMs > 0.0 ? (totalFieldBytes / (1024.0 * 1024.0)) / (execMs / 1000.0) : 0.0;
+
+        l3s::FrameHeader header;
+        header.width = static_cast<uint32_t>(cfg.width);
+        header.height = static_cast<uint32_t>(cfg.height);
+        header.numOverpasses = static_cast<uint32_t>(overpasses.size());
+        header.frameIndex = frameIndex;
+        header.timestampS = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+        header.execMs = execMs;
+        header.throughputMbS = throughputMbS;
+
+        telemetry.publish(header, rawOverpasses, lvza, fused);
+
+        std::cout << "published frame " << frameIndex << "  execMs=" << execMs
+                  << "  throughputMbS=" << throughputMbS << "\n";
+
+        ++frameIndex;
         t += 1.0;
         std::this_thread::sleep_for(std::chrono::milliseconds(kPublishIntervalMs));
     }
