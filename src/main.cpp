@@ -1,13 +1,12 @@
+#include "l3s/Simulator.hpp"
+
 #include <zmq.hpp>
 
 #include <chrono>
 #include <cstring>
 #include <iostream>
 #include <thread>
-#include <vector>
 
-constexpr int kWidth = 64;
-constexpr int kHeight = 64;
 constexpr int kPublishIntervalMs = 500;
 
 int main() {
@@ -19,14 +18,20 @@ int main() {
     // and completed its connect handshake, so give one a moment to attach.
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    std::vector<float> grid(static_cast<size_t>(kWidth) * kHeight, 0.0f);
+    l3s::SimulatorConfig cfg;
+    l3s::Simulator sim(cfg);
 
+    double t = 0.0;
     while (true) {
-        zmq::message_t msg(grid.size() * sizeof(float));
-        std::memcpy(msg.data(), grid.data(), msg.size());
+        const auto field = sim.generate(t);
+
+        zmq::message_t msg(field.size() * sizeof(float));
+        std::memcpy(msg.data(), field.data(), msg.size());
         pub.send(msg, zmq::send_flags::none);
 
-        std::cout << "published " << kWidth << "x" << kHeight << " grid\n";
+        std::cout << "published " << cfg.width << "x" << cfg.height << " field  t=" << t << "\n";
+
+        t += 1.0;
         std::this_thread::sleep_for(std::chrono::milliseconds(kPublishIntervalMs));
     }
 

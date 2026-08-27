@@ -7,4 +7,5 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(cppzmq REQUIRED)
 
 add_executable(l3s_engine src/main.cpp)
+target_include_directories(l3s_engine PRIVATE include)
 target_link_libraries(l3s_engine PRIVATE cppzmq)
