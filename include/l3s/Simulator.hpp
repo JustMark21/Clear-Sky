@@ -35,12 +35,41 @@ struct Overpass {
     std::vector<float> vza;
 };
 
+// Cross-track scan geometry for overpass `k` of `numOverpasses`: a nadir
+// ground-track line through the grid at angle (pi/numOverpasses)*k,
+// slowly rotating with t, offset perpendicular to itself so different
+// passes don't all cross through the center. VZA grows linearly with
+// perpendicular distance from that line and saturates at maxVzaDeg. This
+// is purely geometric -- it does not depend on where the SST values for
+// that overpass actually came from, so it applies equally to a
+// synthetic field or a real one.
+inline std::vector<float> computeVzaField(int width, int height, int k, int numOverpasses, double t,
+                                           double maxVzaDeg) {
+    std::vector<float> vza(static_cast<size_t>(width) * height);
+
+    const double angle = (M_PI / numOverpasses) * k + 0.15 * t;
+    const double perpOffset = (k - (numOverpasses - 1) / 2.0) * (width / static_cast<double>(numOverpasses));
+    const double px = width * 0.5 + perpOffset * std::cos(angle + M_PI / 2.0);
+    const double py = height * 0.5 + perpOffset * std::sin(angle + M_PI / 2.0);
+
+    const double satDist = 0.5 * std::max(width, height);
+    const double gainDegPerPx = maxVzaDeg / satDist;
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const double dist = std::abs((x - px) * std::sin(angle) - (y - py) * std::cos(angle));
+            const double deg = std::min(maxVzaDeg, dist * gainDegPerPx);
+            vza[static_cast<size_t>(y) * width + x] = static_cast<float>(deg);
+        }
+    }
+    return vza;
+}
+
 // Produces `numOverpasses` independent passes over the same underlying
 // scene: a flat Kelvin baseline with one gaussian warm core that drifts
 // along a slow circular path over time. Each pass gets its own
-// cross-track scan geometry (a nadir ground-track line at a different
-// angle/offset, with VZA increasing linearly with perpendicular distance
-// from it) and its own independently placed cloud blobs.
+// cross-track scan geometry (computeVzaField(), above) and its own
+// independently placed cloud blobs.
 class Simulator {
 public:
     explicit Simulator(SimulatorConfig cfg) : cfg_(cfg), rng_(cfg.seed) {}
@@ -52,7 +81,7 @@ public:
         for (int k = 0; k < cfg_.numOverpasses; ++k) {
             Overpass op;
             op.sst = generateTrueField(t);
-            op.vza = computeVza(k, t);
+            op.vza = computeVzaField(cfg_.width, cfg_.height, k, cfg_.numOverpasses, t, cfg_.maxVzaDeg);
             applyCloudMask(op.sst);
             overpasses.push_back(std::move(op));
         }
@@ -78,33 +107,6 @@ private:
             }
         }
         return field;
-    }
-
-    // Nadir ground track k is a line through the grid at angle
-    // (pi/numOverpasses)*k, slowly rotating with t, offset perpendicular
-    // to itself so different passes don't all cross through the center.
-    // VZA grows linearly with perpendicular distance from that line and
-    // saturates at maxVzaDeg.
-    std::vector<float> computeVza(int k, double t) const {
-        std::vector<float> vza(static_cast<size_t>(cfg_.width) * cfg_.height);
-
-        const double angle = (M_PI / cfg_.numOverpasses) * k + 0.15 * t;
-        const double perpOffset =
-            (k - (cfg_.numOverpasses - 1) / 2.0) * (cfg_.width / static_cast<double>(cfg_.numOverpasses));
-        const double px = cfg_.width * 0.5 + perpOffset * std::cos(angle + M_PI / 2.0);
-        const double py = cfg_.height * 0.5 + perpOffset * std::sin(angle + M_PI / 2.0);
-
-        const double satDist = 0.5 * std::max(cfg_.width, cfg_.height);
-        const double gainDegPerPx = cfg_.maxVzaDeg / satDist;
-
-        for (int y = 0; y < cfg_.height; ++y) {
-            for (int x = 0; x < cfg_.width; ++x) {
-                const double dist = std::abs((x - px) * std::sin(angle) - (y - py) * std::cos(angle));
-                const double deg = std::min(cfg_.maxVzaDeg, dist * gainDegPerPx);
-                vza[static_cast<size_t>(y) * cfg_.width + x] = static_cast<float>(deg);
-            }
-        }
-        return vza;
     }
 
     void applyCloudMask(std::vector<float>& field) {
