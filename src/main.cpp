@@ -33,19 +33,24 @@ int main() {
     while (true) {
         const auto overpasses = sim.generateOverpasses(t);
 
+        // LVZA is computed on the raw, undebiased overpasses -- it's the
+        // legacy reference, and the legacy method never saw a debiasing
+        // step. The weighted composite gets the benefit of debiasing.
+        const auto lvza = l3s::buildLvzaComposite(overpasses, cfg.width, cfg.height);
+
+        auto debiased = overpasses;
+        l3s::debiasOverpasses(debiased, cfg.width, cfg.height);
+
         std::vector<std::vector<float>> weights;
-        weights.reserve(overpasses.size());
-        for (const auto& op : overpasses) {
+        weights.reserve(debiased.size());
+        for (const auto& op : debiased) {
             const auto lcr = l3s::computeLCR(op.sst, cfg.width, cfg.height);
             weights.push_back(l3s::computeWeights(op, lcr));
         }
+        const auto fused = l3s::buildWeightedComposite(debiased, weights, cfg.width, cfg.height);
 
-        const auto lvza = l3s::buildLvzaComposite(overpasses, cfg.width, cfg.height);
-        const auto fused = l3s::buildWeightedComposite(overpasses, weights, cfg.width, cfg.height);
-
-        // Wire layout: one part per raw overpass, then LVZA, then the
-        // Eq. (1) weighted composite -- LVZA kept as a legacy reference
-        // alongside the primary fused output.
+        // Wire layout unchanged: one part per RAW overpass (not the
+        // debiased copy), then LVZA, then the fused composite.
         for (size_t k = 0; k < overpasses.size(); ++k) {
             sendField(pub, overpasses[k].sst, true);
         }
