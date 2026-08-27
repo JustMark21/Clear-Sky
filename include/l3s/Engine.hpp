@@ -1,5 +1,6 @@
 #pragma once
 
+#include "l3s/SummedAreaTable.hpp"
 #include "l3s/Simulator.hpp"
 
 #include <cmath>
@@ -7,6 +8,27 @@
 #include <vector>
 
 namespace l3s {
+
+// Local Clear-sky Ratio: the fraction of clear (non-NODATA) pixels within
+// an (2*windowRadius+1) x (2*windowRadius+1) window centered on each
+// pixel, in [0, 1]. A pixel can pass the cloud mask itself yet still sit
+// on a cloud boundary -- LCR captures that by scoring the neighborhood,
+// not just the pixel. windowRadius=5 gives the paper's 11x11 window.
+inline std::vector<float> computeLCR(const std::vector<float>& sst, int width, int height, int windowRadius = 5) {
+    std::vector<float> clearMask(static_cast<size_t>(width) * height);
+    for (size_t i = 0; i < clearMask.size(); ++i) {
+        clearMask[i] = std::isnan(sst[i]) ? 0.0f : 1.0f;
+    }
+
+    const SummedAreaTable sat(clearMask, width, height);
+    std::vector<float> lcr(static_cast<size_t>(width) * height);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            lcr[static_cast<size_t>(y) * width + x] = static_cast<float>(sat.boxMean(x, y, windowRadius));
+        }
+    }
+    return lcr;
+}
 
 // Naive lowest-view-zenith-angle composite: at each pixel, take the SST
 // value from whichever overpass observed it at the smallest VZA among
