@@ -32,7 +32,7 @@ region used in the paper's own Fig. 8/9 debiasing demonstration.
 FOUR INDEPENDENT FETCHES PER SCENE: each overpass (A1, B1, A2, C1, ...)
 is built from its OWN real ERDDAP query, not one fetch reused four times.
 By default that means the same AOI and dataset but four different real
-calendar days (today, today-1, today-2, today-3 -- see --erddap-day-
+calendar days (anchor, anchor-1, anchor-2, anchor-3 -- see --erddap-day-
 offsets), which is both a faithful analog of the paper's actual A1/B1/A2/
 C1 scenario (near-identical geography, genuinely different acquisition
 times within the collation window) and something this worker can verify
@@ -44,6 +44,16 @@ repeated with only a synthetic overlay on top. --erddap-datasets lets you
 point individual slots at different real dataset IDs too (e.g. if you
 have access to distinct per-instrument products), cycling through the
 list if you give fewer than --overpasses entries.
+
+"anchor" above is the most recent day _find_latest_published_grid()
+actually confirmed is published, NOT necessarily today: JPL's MUR SST
+processing lag is not perfectly constant, so a granule that was available
+one cycle can 404 the next. The search starts --erddap-lookback-start-
+days back (2, to clear typical processing time) and, only on an HTTP 404,
+steps one day further back at a time up to --erddap-lookback-max-days (7)
+until it finds one that's actually there -- a transient 404 degrades
+gracefully to trying an older day, not to a synthetic fallback for the
+whole scene.
 
 NOTE on ERDDAP time syntax: "last-N" relative-time arithmetic was tested
 against jplMURSST41 and did NOT step backwards as its own name implies
@@ -342,32 +352,82 @@ def fetch_live_grid(width: int, height: int, base_url: str, dataset: str, variab
     return out
 
 
+def _find_latest_published_grid(width: int, height: int, base_url: str, dataset: str, variable: str,
+                                 lat0: float, lat1: float, lon0: float, lon1: float, timeout_s: float,
+                                 start_offset_days: int = 2, max_offset_days: int = 7):
+    """Searches backward, one day at a time, for the most recent day
+    NOAA CoastWatch ERDDAP has actually finished publishing for `dataset`,
+    instead of assuming any fixed offset (e.g. "yesterday") is always
+    safe -- JPL's processing lag is not perfectly constant, so an offset
+    that worked last cycle can 404 the next.
+
+    Starts at start_offset_days (2, to clear typical processing time)
+    and, ONLY on an HTTP 404 (the specific "not published yet" signal --
+    anything else, a timeout/connection error/malformed CSV/all-NaN
+    tile/etc., is a different failure mode and is NOT retried here; it
+    propagates immediately exactly like a single fetch_live_grid call
+    would), steps the offset forward one day at a time up to
+    max_offset_days.
+
+    Returns (grid, resolved_date, offset_days) for the first day that
+    succeeds -- the caller gets the fetched tile back too, so it never
+    has to re-fetch the same day a second time. Raises the last exception
+    seen if nothing in [start_offset_days, max_offset_days] is published;
+    this is a plain exception, not a crash -- run_worker()'s existing
+    live-fetch try/except is what turns that into a same-cycle fallback
+    to synth_scene(), so a fully-exhausted search degrades the pipeline
+    for one cycle instead of taking it down."""
+    last_exc: Exception | None = None
+    for offset in range(start_offset_days, max_offset_days + 1):
+        resolved_date = date.today() - timedelta(days=offset)
+        try:
+            grid = fetch_live_grid(width, height, base_url, dataset, variable, lat0, lat1, lon0, lon1,
+                                    timeout_s, time_selector=resolved_date.isoformat())
+            return grid, resolved_date, offset
+        except Exception as e:  # noqa: BLE001 - narrowed to "was this specifically a 404" immediately below
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if _HAVE_REQUESTS and isinstance(e, requests.exceptions.HTTPError) and status == 404:
+                logging.debug("[%s] %s not published yet (404) -- trying %d day(s) back next",
+                              dataset, resolved_date.isoformat(), offset + 1)
+                last_exc = e
+                continue
+            raise  # a non-404 failure is a different problem; don't mask it by trying more days
+    raise last_exc or RuntimeError(
+        f"no published {dataset} granule found {start_offset_days}-{max_offset_days} day(s) back")
+
+
 @dataclass
 class OverpassSource:
     """Where one overpass's real SST tile comes from -- its own dataset ID
     and its own time selector, so four overpasses built from this are four
     independent ERDDAP queries, not one fetch reused four times."""
     dataset: str
-    time_selector: str  # "last" or an explicit "YYYY-MM-DD"
+    time_selector: str  # an explicit "YYYY-MM-DD", relative to a confirmed-published anchor day
 
 
-def _resolve_overpass_sources(args: argparse.Namespace, num_overpasses: int) -> list[OverpassSource]:
+def _resolve_overpass_sources(args: argparse.Namespace, num_overpasses: int,
+                               anchor_date: date) -> list[OverpassSource]:
     """Builds one OverpassSource per overpass slot from --erddap-datasets
     (cycled if shorter than num_overpasses; defaults to --erddap-dataset
     repeated) and --erddap-day-offsets (cycled the same way; each offset N
-    means "N real calendar days before today", giving a genuinely
+    means "N real calendar days before anchor_date", giving a genuinely
     different real day -- and therefore a genuinely different real SST
-    field -- per overpass by default)."""
+    field -- per overpass by default).
+
+    anchor_date must be a day _find_latest_published_grid() has already
+    CONFIRMED is published (see live_scene()) -- offsets are relative to
+    that verified day, not to date.today(). Anchoring to an unverified
+    wall-clock date is exactly what let a 404 through before this fix:
+    JPL's processing lag means "today" (offset 0) is frequently not
+    published yet."""
     datasets = [d.strip() for d in args.erddap_datasets.split(",") if d.strip()] or [args.erddap_dataset]
     offsets = [int(o.strip()) for o in args.erddap_day_offsets.split(",") if o.strip() != ""] or [0]
 
-    today = date.today()
     sources = []
     for k in range(num_overpasses):
         ds = datasets[k % len(datasets)]
         offset = offsets[k % len(offsets)]
-        selector = "last" if offset == 0 else (today - timedelta(days=offset)).isoformat()
-        sources.append(OverpassSource(ds, selector))
+        sources.append(OverpassSource(ds, (anchor_date - timedelta(days=offset)).isoformat()))
     return sources
 
 
@@ -381,16 +441,38 @@ def live_scene(width: int, height: int, num_overpasses: int, t: float,
     this function raises too (no partial/mixed scene is ever built or
     returned) -- run_worker()'s existing try/except is what turns that
     into a full fallback to synth_scene() for the whole cycle."""
-    sources = _resolve_overpass_sources(args, num_overpasses)
+    # Anchor-day discovery FIRST: which real day is actually published is
+    # not assumed, it's confirmed (see _find_latest_published_grid) using
+    # the first configured dataset (every slot's relative offset in
+    # _resolve_overpass_sources is then computed from this verified day,
+    # on the assumption every configured dataset shares roughly the same
+    # publication cadence -- reasonable for slots that are all MUR SST by
+    # default, less so if --erddap-datasets points at wildly different
+    # products).
+    anchor_dataset = ([d.strip() for d in args.erddap_datasets.split(",") if d.strip()] or [args.erddap_dataset])[0]
+    anchor_grid, anchor_date, anchor_offset = _find_latest_published_grid(
+        width, height, args.erddap_base, anchor_dataset, args.erddap_variable,
+        args.lat0, args.lat1, args.lon0, args.lon1, args.fetch_timeout,
+        start_offset_days=args.erddap_lookback_start_days, max_offset_days=args.erddap_lookback_max_days)
+    logging.debug("anchor day for this scene: %s (%d day(s) back, dataset=%s)",
+                  anchor_date.isoformat(), anchor_offset, anchor_dataset)
+
+    sources = _resolve_overpass_sources(args, num_overpasses, anchor_date)
     xs, ys = np.meshgrid(np.arange(width, dtype=np.float64), np.arange(height, dtype=np.float64))
     forced_blobs = _maybe_persistent_storm(width, height, rng,
                                             getattr(args, "persistent_storm_probability", 0.0))
 
-    # Fetch every overpass's own tile FIRST, so a failure on fetch #3 (say)
-    # never leaves overpasses 0-2 partially built into the outgoing scene --
-    # either all N real tiles are in hand, or none of them are used at all.
+    # Fetch every remaining overpass's own tile, so a failure on fetch #3
+    # (say) never leaves overpasses 0-2 partially built into the outgoing
+    # scene -- either all N real tiles are in hand, or none of them are
+    # used at all. Whichever slot resolved to the exact anchor day+dataset
+    # reuses the grid the discovery search above already fetched, instead
+    # of querying ERDDAP for the identical tile a second time.
     tiles: list[np.ndarray] = []
     for src in sources:
+        if src.dataset == anchor_dataset and src.time_selector == anchor_date.isoformat():
+            tiles.append(anchor_grid)
+            continue
         tile = fetch_live_grid(width, height, args.erddap_base, src.dataset, args.erddap_variable,
                                 args.lat0, args.lat1, args.lon0, args.lon1,
                                 args.fetch_timeout, time_selector=src.time_selector)
@@ -513,16 +595,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
                             "Point different slots at different real instrument products here if you have access.")
     live.add_argument("--erddap-day-offsets", default="0,1,2,3",
                        help="comma-separated integers, one per overpass slot, cycled if shorter than "
-                            "--overpasses. Each N means 'N real calendar days before today' (0 = --erddap 'last'), "
-                            "giving each overpass a genuinely different real day's data (verified: MUR SST at a "
-                            "fixed point measurably differs day to day) instead of one fetch reused for all slots.")
+                            "--overpasses. Each N means 'N real calendar days before the confirmed-published "
+                            "anchor day' (see --erddap-lookback-start-days/--erddap-lookback-max-days), giving "
+                            "each overpass a genuinely different real day's data (verified: MUR SST at a fixed "
+                            "point measurably differs day to day) instead of one fetch reused for all slots.")
+    live.add_argument("--erddap-lookback-start-days", type=int, default=2,
+                       help="first offset (days before today) to try when discovering the most recent PUBLISHED "
+                            "day -- 2 clears typical JPL processing time (default: 2)")
+    live.add_argument("--erddap-lookback-max-days", type=int, default=7,
+                       help="last offset to try before giving up on the live fetch for this cycle and falling "
+                            "back to synthetic (default: 7)")
     live.add_argument("--erddap-variable", default="analysed_sst")
     live.add_argument("--lat0", type=float, default=-38.0)
     live.add_argument("--lat1", type=float, default=-34.5)
     live.add_argument("--lon0", type=float, default=18.5)
     live.add_argument("--lon1", type=float, default=23.5)
     live.add_argument("--fetch-timeout", type=float, default=20.0,
-                       help="seconds, PER independent fetch (up to --overpasses fetches happen per cycle)")
+                       help="seconds, PER independent fetch (up to --overpasses+1 fetches happen per cycle, "
+                            "including the anchor-day discovery search)")
 
     p.add_argument("-v", "--verbose", action="store_true")
     return p
