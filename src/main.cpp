@@ -7,6 +7,7 @@
 #include <cstring>
 #include <iostream>
 #include <thread>
+#include <vector>
 
 constexpr int kPublishIntervalMs = 500;
 
@@ -14,12 +15,6 @@ static void sendField(zmq::socket_t& pub, const std::vector<float>& field, bool 
     zmq::message_t msg(field.size() * sizeof(float));
     std::memcpy(msg.data(), field.data(), msg.size());
     pub.send(msg, more ? zmq::send_flags::sndmore : zmq::send_flags::none);
-}
-
-static double meanLcr(const std::vector<float>& lcr) {
-    double sum = 0.0;
-    for (float v : lcr) sum += v;
-    return lcr.empty() ? 0.0 : sum / static_cast<double>(lcr.size());
 }
 
 int main() {
@@ -37,22 +32,27 @@ int main() {
     double t = 0.0;
     while (true) {
         const auto overpasses = sim.generateOverpasses(t);
-        const auto lvza = l3s::buildLvzaComposite(overpasses, cfg.width, cfg.height);
 
-        // LCR is computed per overpass here so its behavior can be
-        // sanity-checked against real cloud coverage before it feeds
-        // into any fusion weighting.
-        for (size_t k = 0; k < overpasses.size(); ++k) {
-            const auto lcr = l3s::computeLCR(overpasses[k].sst, cfg.width, cfg.height);
-            std::cout << "overpass " << k << " mean LCR=" << meanLcr(lcr) << "\n";
+        std::vector<std::vector<float>> weights;
+        weights.reserve(overpasses.size());
+        for (const auto& op : overpasses) {
+            const auto lcr = l3s::computeLCR(op.sst, cfg.width, cfg.height);
+            weights.push_back(l3s::computeWeights(op, lcr));
         }
 
-        // Wire layout unchanged: one part per raw overpass, in order,
-        // followed by the LVZA composite as the final part.
+        const auto lvza = l3s::buildLvzaComposite(overpasses, cfg.width, cfg.height);
+        const auto fused = l3s::buildWeightedComposite(overpasses, weights, cfg.width, cfg.height);
+
+        // Wire layout: one part per raw overpass, then LVZA, then the
+        // Eq. (1) weighted composite -- LVZA kept as a legacy reference
+        // alongside the primary fused output.
         for (size_t k = 0; k < overpasses.size(); ++k) {
             sendField(pub, overpasses[k].sst, true);
         }
-        sendField(pub, lvza, false);
+        sendField(pub, lvza, true);
+        sendField(pub, fused, false);
+
+        std::cout << "published " << overpasses.size() << " overpasses + lvza + fused  t=" << t << "\n";
 
         t += 1.0;
         std::this_thread::sleep_for(std::chrono::milliseconds(kPublishIntervalMs));

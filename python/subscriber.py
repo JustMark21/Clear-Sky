@@ -22,13 +22,15 @@ sub = ctx.socket(zmq.SUB)
 sub.connect(ENDPOINT)
 sub.setsockopt(zmq.SUBSCRIBE, b"")
 
-fig, (ax_raw, ax_lvza) = plt.subplots(1, 2, figsize=(10, 5))
+fig, (ax_raw, ax_lvza, ax_fused) = plt.subplots(1, 3, figsize=(15, 5))
 
 blank = np.zeros((HEIGHT, WIDTH), dtype=np.float32)
 im_raw = ax_raw.imshow(blank, origin="lower", cmap=SST_CMAP, vmin=VMIN_K, vmax=VMAX_K)
 im_lvza = ax_lvza.imshow(blank, origin="lower", cmap=SST_CMAP, vmin=VMIN_K, vmax=VMAX_K)
-ax_lvza.set_title("LVZA composite")
-fig.colorbar(im_lvza, ax=[ax_raw, ax_lvza], label="SST (K)")
+im_fused = ax_fused.imshow(blank, origin="lower", cmap=SST_CMAP, vmin=VMIN_K, vmax=VMAX_K)
+ax_lvza.set_title("LVZA composite (legacy)")
+ax_fused.set_title("Eq. (1) weighted composite")
+fig.colorbar(im_fused, ax=[ax_raw, ax_lvza, ax_fused], label="SST (K)")
 plt.ion()
 plt.show()
 
@@ -40,6 +42,7 @@ while True:
         np.frombuffer(p, dtype=np.float32).reshape(HEIGHT, WIDTH) for p in parts[:NUM_OVERPASSES]
     ]
     lvza = np.frombuffer(parts[NUM_OVERPASSES], dtype=np.float32).reshape(HEIGHT, WIDTH)
+    fused = np.frombuffer(parts[NUM_OVERPASSES + 1], dtype=np.float32).reshape(HEIGHT, WIDTH)
 
     # Only one raw-overpass panel exists so far -- cycle through the
     # available overpasses one per frame rather than picking a fixed one.
@@ -48,6 +51,7 @@ while True:
     raw_cycle_index = (raw_cycle_index + 1) % len(overpasses)
 
     im_lvza.set_data(lvza)
+    im_fused.set_data(fused)
 
     fig.canvas.draw_idle()
     fig.canvas.flush_events()
