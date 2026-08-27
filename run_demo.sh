@@ -16,7 +16,6 @@
 # Usage: ./run_demo.sh [--region NAME|LAT0,LAT1,LON0,LON1] [--width N]
 #                       [--height N] [--overpasses N] [--fps N]
 #                       [--interval SEC] [--offline]
-#                       [--persistent-storm-probability P]
 set -uo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -74,10 +73,10 @@ Usage: ./run_demo.sh [options]
         launch time, proportional to whatever aspect ratio you request, so
         it always fills the grid instead of being tuned for one specific
         resolution and squeezed/clipped at any other:
-          agulhas     (default) Agulhas Current, South Africa
+          agulhas     (default) Agulhas Current, South Africa -- paper Fig. 8/9
           florida     Straits of Florida / Gulf Stream inflow
           gulfstream  Gulf Stream off Cape Hatteras
-          monterey    Monterey Bay, CA
+          monterey    Monterey Bay, CA -- paper Fig. 6/7
         Custom example: --region 20.0,26.0,-158.0,-150.0
         (custom boxes are used exactly as given, NOT auto-scaled -- if the
         span is too small for your --width/--height, run_demo.sh warns)
@@ -92,11 +91,12 @@ Usage: ./run_demo.sh [options]
   --offline        force the worker to --source synthetic (zero network
                    calls) -- use this to rehearse with no live dependency
   --persistent-storm-probability P
-                   probability in [0,1] that a given scene gets one cloud
-                   gap forced at the SAME position across every overpass,
-                   guaranteeing a region invalid in all of them at once
-                   instead of leaving that to chance overlap. Forwarded
-                   as-is to ingestion_worker.py (default: 0.0 -- disabled)
+                   probability in [0,1] that a given storm is "persistent"
+                   -- locked to the same position across all overpasses in
+                   a scene instead of jittering independently per pass, so
+                   it can mask the IDENTICAL pixels in every raw overpass
+                   simultaneously. Forwarded as-is to ingestion_worker.py
+                   (default: 0.0 -- disabled, matches prior behavior)
   -h, --help       show this help and exit
 
 Ctrl+C, or closing the dashboard window, cleanly stops every process this
@@ -139,7 +139,7 @@ done
 # launch time, from the actual --width/--height, so it is proportional to
 # whatever aspect ratio is requested (4:3, 3:2, 16:9, 16:10, ...) instead
 # of being sized for one specific resolution and under-filled/clipped at
-# any other.
+# any other -- which is what happened when these were fixed boxes.
 # ---------------------------------------------------------------------------
 compute_bbox() {
     # $1=lat_center $2=lon_center $3=width_px $4=height_px -> "lat0 lat1 lon0 lon1"
@@ -227,7 +227,6 @@ fi
 # ---------------------------------------------------------------------------
 ENGINE_PID=""
 WORKER_PID=""
-DASHBOARD_PID=""
 CLEANED_UP=0
 
 cleanup() {
@@ -242,20 +241,21 @@ cleanup() {
     echo "[run_demo] shutting down..."
 
     local pid
-    for pid in "$DASHBOARD_PID" "$WORKER_PID" "$ENGINE_PID"; do
+    for pid in "$WORKER_PID" "$ENGINE_PID"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             kill -TERM "$pid" 2>/dev/null
         fi
     done
 
-    # All three processes handle SIGTERM/SIGINT for a clean shutdown;
-    # give them a brief grace period, then escalate to SIGKILL for
-    # anything still alive so no process -- and no bound ZeroMQ port --
-    # is ever left behind.
+    # Both processes handle SIGTERM/SIGINT for a clean shutdown (the
+    # engine closes its ZMQ sockets via RAII, the worker via its own
+    # try/finally); give them a brief grace period, then escalate to
+    # SIGKILL for anything still alive so no process -- and no bound
+    # ZeroMQ port -- is ever left behind.
     local waited=0
     while (( waited < 20 )); do
         local any_alive=0
-        for pid in "$DASHBOARD_PID" "$WORKER_PID" "$ENGINE_PID"; do
+        for pid in "$WORKER_PID" "$ENGINE_PID"; do
             if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
                 any_alive=1
             fi
@@ -264,14 +264,14 @@ cleanup() {
         sleep 0.25
         waited=$((waited + 1))
     done
-    for pid in "$DASHBOARD_PID" "$WORKER_PID" "$ENGINE_PID"; do
+    for pid in "$WORKER_PID" "$ENGINE_PID"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             echo "[run_demo] pid $pid still alive after grace period, sending SIGKILL"
             kill -KILL "$pid" 2>/dev/null
         fi
     done
 
-    wait "$DASHBOARD_PID" "$WORKER_PID" "$ENGINE_PID" 2>/dev/null
+    wait "$WORKER_PID" "$ENGINE_PID" 2>/dev/null
     echo "[run_demo] all processes stopped, ports released."
 }
 trap cleanup EXIT INT TERM
@@ -364,19 +364,12 @@ if ! kill -0 "$WORKER_PID" 2>/dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Launch the dashboard, then block on the `wait` BUILTIN rather than
-#    running it as a plain synchronous foreground command. This matters:
-#    bash defers a trapped signal until the current foreground command
-#    completes, so if the dashboard ran directly in the foreground here,
-#    Ctrl+C / SIGTERM would never reach cleanup() until the dashboard
-#    exited on its own -- which it never does. `wait` is interruptible:
-#    a pending trap fires immediately and `wait` returns, so cleanup()
-#    runs right away instead of leaving the whole pipeline orphaned.
+# 4. Launch the dashboard in the FOREGROUND. Closing its window (or
+#    Ctrl+C) returns control here, the script reaches its end, and the
+#    EXIT trap tears everything else down.
 # ---------------------------------------------------------------------------
 echo "[run_demo] launching dashboard -- close its window, or press Ctrl+C here, to stop everything"
 echo
-"$VENV_PY" python/subscriber.py --endpoint "$PUB_HOST_ENDPOINT" &
-DASHBOARD_PID=$!
-wait "$DASHBOARD_PID"
+"$VENV_PY" python/subscriber.py --endpoint "$PUB_HOST_ENDPOINT"
 
 echo "[run_demo] dashboard closed."

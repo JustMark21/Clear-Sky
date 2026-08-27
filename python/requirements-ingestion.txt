@@ -1,1 +1,5 @@
-requests
+# Extra dependency for python/ingestion_worker.py's LIVE fetch path only.
+# The worker runs fine without this installed -- it just always falls
+# back to synthetic scenes (see fetch_live_grid()'s _HAVE_REQUESTS guard).
+# Kept separate from requirements.txt so dashboard-only users don't need it.
+requests>=2.31
