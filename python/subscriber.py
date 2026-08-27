@@ -1,3 +1,5 @@
+import copy
+
 import numpy as np
 import zmq
 import matplotlib.pyplot as plt
@@ -11,6 +13,12 @@ ENDPOINT = "tcp://localhost:5556"
 VMIN_K = 286.0
 VMAX_K = 296.0
 
+# NaN pixels are cloud-obscured (NODATA), not a real temperature of zero
+# -- give them their own distinct color instead of letting the colormap
+# extrapolate or silently drop them.
+SST_CMAP = copy.copy(plt.get_cmap("inferno"))
+SST_CMAP.set_bad(color="#000000")
+
 ctx = zmq.Context()
 sub = ctx.socket(zmq.SUB)
 sub.connect(ENDPOINT)
@@ -20,7 +28,7 @@ fig, ax = plt.subplots()
 im = ax.imshow(
     np.zeros((HEIGHT, WIDTH), dtype=np.float32),
     origin="lower",
-    cmap="inferno",
+    cmap=SST_CMAP,
     vmin=VMIN_K,
     vmax=VMAX_K,
 )
