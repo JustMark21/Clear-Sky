@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <optional>
 #include <random>
 #include <vector>
 
@@ -24,6 +25,13 @@ struct SimulatorConfig {
     int numOverpasses = 4;
     double maxVzaDeg = 60.0; // view zenith angle at the swath edge
 
+    // Probability, per tick, of a "persistent storm": a single cloud
+    // blob stamped at the SAME position in every overpass that tick,
+    // rather than each overpass getting independently random cloud
+    // placement. Guarantees a region invalid in all overpasses at once,
+    // instead of leaving that up to chance overlap. 0.0 = never (default).
+    double persistentStormProbability = 0.0;
+
     unsigned seed = 42;
 };
 
@@ -33,6 +41,10 @@ struct SimulatorConfig {
 struct Overpass {
     std::vector<float> sst;
     std::vector<float> vza;
+};
+
+struct CloudBlob {
+    double cx, cy, r;
 };
 
 // Cross-track scan geometry for overpass `k` of `numOverpasses`: a nadir
@@ -69,12 +81,16 @@ inline std::vector<float> computeVzaField(int width, int height, int k, int numO
 // scene: a flat Kelvin baseline with one gaussian warm core that drifts
 // along a slow circular path over time. Each pass gets its own
 // cross-track scan geometry (computeVzaField(), above) and its own
-// independently placed cloud blobs.
+// independently placed cloud blobs, plus -- with probability
+// persistentStormProbability -- one additional blob stamped at the
+// identical position in every pass this tick.
 class Simulator {
 public:
     explicit Simulator(SimulatorConfig cfg) : cfg_(cfg), rng_(cfg.seed) {}
 
     std::vector<Overpass> generateOverpasses(double t) {
+        const auto persistentBlob = maybeRollPersistentStorm();
+
         std::vector<Overpass> overpasses;
         overpasses.reserve(cfg_.numOverpasses);
 
@@ -82,7 +98,7 @@ public:
             Overpass op;
             op.sst = generateTrueField(t);
             op.vza = computeVzaField(cfg_.width, cfg_.height, k, cfg_.numOverpasses, t, cfg_.maxVzaDeg);
-            applyCloudMask(op.sst);
+            applyCloudMask(op.sst, persistentBlob);
             overpasses.push_back(std::move(op));
         }
         return overpasses;
@@ -109,24 +125,38 @@ private:
         return field;
     }
 
-    void applyCloudMask(std::vector<float>& field) {
+    std::optional<CloudBlob> maybeRollPersistentStorm() {
+        if (cfg_.persistentStormProbability <= 0.0) return std::nullopt;
+        std::uniform_real_distribution<double> u01(0.0, 1.0);
+        if (u01(rng_) >= cfg_.persistentStormProbability) return std::nullopt;
+
+        std::uniform_real_distribution<double> cxDist(cfg_.width * 0.3, cfg_.width * 0.7);
+        std::uniform_real_distribution<double> cyDist(cfg_.height * 0.3, cfg_.height * 0.7);
+        const double r = 0.22 * std::min(cfg_.width, cfg_.height);
+        return CloudBlob{cxDist(rng_), cyDist(rng_), r};
+    }
+
+    void applyCloudMask(std::vector<float>& field, const std::optional<CloudBlob>& persistentBlob) {
         std::uniform_real_distribution<double> cxDist(0.0, cfg_.width);
         std::uniform_real_distribution<double> cyDist(0.0, cfg_.height);
         std::uniform_real_distribution<double> rDist(cfg_.cloudRadiusMinPx, cfg_.cloudRadiusMaxPx);
 
         for (int b = 0; b < cfg_.numCloudBlobs; ++b) {
-            const double bx = cxDist(rng_);
-            const double by = cyDist(rng_);
-            const double br = rDist(rng_);
-            const double br2 = br * br;
+            stampBlob(field, cxDist(rng_), cyDist(rng_), rDist(rng_));
+        }
+        if (persistentBlob) {
+            stampBlob(field, persistentBlob->cx, persistentBlob->cy, persistentBlob->r);
+        }
+    }
 
-            for (int y = 0; y < cfg_.height; ++y) {
-                for (int x = 0; x < cfg_.width; ++x) {
-                    const double dx = x - bx;
-                    const double dy = y - by;
-                    if (dx * dx + dy * dy <= br2) {
-                        field[static_cast<size_t>(y) * cfg_.width + x] = NODATA;
-                    }
+    void stampBlob(std::vector<float>& field, double bx, double by, double br) const {
+        const double br2 = br * br;
+        for (int y = 0; y < cfg_.height; ++y) {
+            for (int x = 0; x < cfg_.width; ++x) {
+                const double dx = x - bx;
+                const double dy = y - by;
+                if (dx * dx + dy * dy <= br2) {
+                    field[static_cast<size_t>(y) * cfg_.width + x] = NODATA;
                 }
             }
         }

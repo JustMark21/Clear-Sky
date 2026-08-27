@@ -1,3 +1,4 @@
+import argparse
 import copy
 import struct
 from dataclasses import dataclass
@@ -6,14 +7,6 @@ import numpy as np
 import zmq
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
-
-ENDPOINT = "tcp://localhost:5556"
-
-# Only used to size the initial blank imshow canvases before the first
-# real frame arrives -- must match SimulatorConfig's defaults so the
-# image extent doesn't have to be re-scaled once real data lands.
-WIDTH = 64
-HEIGHT = 64
 
 FRAME_MAGIC = 0x3353334C  # "L3S3"
 FRAME_VERSION = 1
@@ -90,9 +83,13 @@ def decode_frame(parts):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="L3S-LEO dashboard: renders the engine's live PUB telemetry.")
+    parser.add_argument("--endpoint", default="tcp://localhost:5556")
+    args = parser.parse_args()
+
     ctx = zmq.Context()
     sub = ctx.socket(zmq.SUB)
-    sub.connect(ENDPOINT)
+    sub.connect(args.endpoint)
     sub.setsockopt(zmq.SUBSCRIBE, b"")
 
     fig = plt.figure(figsize=(14, 8))
@@ -104,10 +101,11 @@ def main():
     ax_hud = fig.add_subplot(gs[2, :])
     ax_hud.axis("off")
 
-    blank = np.zeros((HEIGHT, WIDTH), dtype=np.float32)
+    blank = np.zeros((1, 1), dtype=np.float32)
     im_raw = [ax.imshow(blank, origin="lower", cmap=SST_CMAP, vmin=VMIN_K, vmax=VMAX_K) for ax in ax_raw]
     im_lvza = ax_lvza.imshow(blank, origin="lower", cmap=SST_CMAP, vmin=VMIN_K, vmax=VMAX_K)
     im_fused = ax_fused.imshow(blank, origin="lower", cmap=SST_CMAP, vmin=VMIN_K, vmax=VMAX_K)
+    all_images = [*im_raw, im_lvza, im_fused]
 
     for i, ax in enumerate(ax_raw):
         ax.set_title(f"raw overpass {i}")
@@ -120,11 +118,25 @@ def main():
     plt.ion()
     plt.show()
 
+    # The engine's --width/--height are CLI-configurable per run_demo.sh
+    # invocation, and this process has no independent way of knowing
+    # them -- so instead of assuming a fixed grid size, every image's
+    # extent is (re)synced to whatever the wire header actually reports,
+    # the first time it's seen and again if it ever changes.
+    current_dims = None
+
     while True:
         parts = sub.recv_multipart()
         frame = decode_frame(parts)
         if frame is None:
             continue
+
+        dims = (frame.width, frame.height)
+        if dims != current_dims:
+            extent = (-0.5, frame.width - 0.5, -0.5, frame.height - 0.5)
+            for im in all_images:
+                im.set_extent(extent)
+            current_dims = dims
 
         for i in range(frame.num_overpasses):
             im_raw[i].set_data(frame.overpasses[i])

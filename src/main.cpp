@@ -12,10 +12,14 @@
 #include <thread>
 #include <vector>
 
-constexpr int kPublishIntervalMs = 500;
 constexpr int kIngestPollTimeoutMs = 200;
 
 struct Args {
+    int width = 64;
+    int height = 64;
+    int overpasses = 4;
+    double fps = 2.0;
+    std::string endpoint = "tcp://*:5556";
     std::string source = "sim"; // "sim" | "live"
     std::string ingestEndpoint = "tcp://*:5557";
     double staleCeilingS = 15.0; // how long a live scene stays "current" before reverting to fallback
@@ -25,7 +29,17 @@ static Args parseArgs(int argc, char** argv) {
     Args args;
     for (int i = 1; i < argc; ++i) {
         const std::string flag = argv[i];
-        if (flag == "--source" && i + 1 < argc) {
+        if (flag == "--width" && i + 1 < argc) {
+            args.width = std::stoi(argv[++i]);
+        } else if (flag == "--height" && i + 1 < argc) {
+            args.height = std::stoi(argv[++i]);
+        } else if (flag == "--overpasses" && i + 1 < argc) {
+            args.overpasses = std::stoi(argv[++i]);
+        } else if (flag == "--fps" && i + 1 < argc) {
+            args.fps = std::stod(argv[++i]);
+        } else if (flag == "--endpoint" && i + 1 < argc) {
+            args.endpoint = argv[++i];
+        } else if (flag == "--source" && i + 1 < argc) {
             args.source = argv[++i];
         } else if (flag == "--ingest-endpoint" && i + 1 < argc) {
             args.ingestEndpoint = argv[++i];
@@ -38,16 +52,20 @@ static Args parseArgs(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     const Args args = parseArgs(argc, argv);
+    const int publishIntervalMs = args.fps > 0.0 ? static_cast<int>(1000.0 / args.fps) : 500;
 
     zmq::context_t ctx(1);
     zmq::socket_t pub(ctx, zmq::socket_type::pub);
-    pub.bind("tcp://*:5556");
+    pub.bind(args.endpoint);
 
     // A PUB socket silently drops anything sent before a SUB has joined
     // and completed its connect handshake, so give one a moment to attach.
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     l3s::SimulatorConfig cfg;
+    cfg.width = args.width;
+    cfg.height = args.height;
+    cfg.numOverpasses = args.overpasses;
     l3s::Simulator sim(cfg);
     l3s::TelemetryPublisher telemetry(pub);
 
@@ -67,8 +85,6 @@ int main(int argc, char** argv) {
     double t = 0.0;
     uint32_t frameIndex = 0;
     while (true) {
-        const auto tComputeStart = std::chrono::steady_clock::now();
-
         if (args.source == "live") {
             const auto sceneOpt = receiver->receiveScene(kIngestPollTimeoutMs);
             const auto now = std::chrono::steady_clock::now();
@@ -117,6 +133,14 @@ int main(int argc, char** argv) {
 
         const auto& overpasses = currentOverpasses;
 
+        // Timed from here, not from the top of the loop: the live path's
+        // receiveScene() above blocks on a ZMQ poll for up to
+        // kIngestPollTimeoutMs, which is wait time, not compute time --
+        // folding it into execMs would make the HUD's throughput number
+        // describe how promptly the worker happens to publish, not how
+        // fast the fusion pipeline itself runs.
+        const auto tComputeStart = std::chrono::steady_clock::now();
+
         // LVZA is computed on the raw, undebiased overpasses -- it's the
         // legacy reference, and the legacy method never saw a debiasing
         // step. The weighted composite gets the benefit of debiasing.
@@ -160,7 +184,7 @@ int main(int argc, char** argv) {
 
         ++frameIndex;
         t += 1.0;
-        std::this_thread::sleep_for(std::chrono::milliseconds(kPublishIntervalMs));
+        std::this_thread::sleep_for(std::chrono::milliseconds(publishIntervalMs));
     }
 
     return 0;

@@ -122,7 +122,8 @@ def fetch_live_grid(lat0: float, lat1: float, lon0: float, lon1: float, width: i
 def synth_grid(width: int, height: int, rng: np.random.Generator) -> np.ndarray:
     """Local fallback scene: a flat Kelvin baseline with one gaussian
     warm core plus a handful of circular cloud gaps, used whenever a
-    given overpass's live fetch fails for any reason."""
+    given overpass's live fetch fails for any reason, or whenever
+    running with --source synthetic."""
     baseline_k = 288.15
     amplitude_k = 6.0
     sigma_px = 0.2 * min(width, height)
@@ -143,18 +144,45 @@ def synth_grid(width: int, height: int, rng: np.random.Generator) -> np.ndarray:
 
 
 def _fetch_one_overpass(source: OverpassSource, lat0: float, lat1: float, lon0: float, lon1: float, width: int,
-                         height: int) -> tuple:
+                         height: int, force_synthetic: bool) -> tuple:
     """Runs in a worker thread, one per overpass, so the 4 fetches are in
     flight concurrently. Each overpass's failure is independent -- one
     source timing out or erroring falls that overpass back to synthetic
-    without affecting the other, successfully-fetched overpasses."""
-    try:
-        grid = fetch_live_grid(lat0, lat1, lon0, lon1, width, height, time_selector=source.time_selector)
-        return grid, "live"
-    except Exception as exc:  # noqa: BLE001 -- any failure degrades this one overpass, never the whole scene
-        print(f"[ingestion_worker] overpass {source.source_id} (day_offset={source.day_offset}) "
-              f"live fetch failed ({exc}) -- falling back to synthetic", file=sys.stderr)
-        return synth_grid(width, height, np.random.default_rng()), "synthetic"
+    without affecting the other, successfully-fetched overpasses.
+    force_synthetic skips the network entirely (--source synthetic)."""
+    if not force_synthetic:
+        try:
+            grid = fetch_live_grid(lat0, lat1, lon0, lon1, width, height, time_selector=source.time_selector)
+            return grid, "live"
+        except Exception as exc:  # noqa: BLE001 -- any failure degrades this one overpass, never the whole scene
+            print(f"[ingestion_worker] overpass {source.source_id} (day_offset={source.day_offset}) "
+                  f"live fetch failed ({exc}) -- falling back to synthetic", file=sys.stderr)
+    return synth_grid(width, height, np.random.default_rng()), "synthetic"
+
+
+def _maybe_persistent_storm(width: int, height: int, rng: np.random.Generator, probability: float):
+    """With probability `probability`, returns one (cx, cy, r) cloud blob
+    to be stamped at the IDENTICAL position onto every overpass this
+    tick -- guaranteeing a region invalid in all of them simultaneously,
+    rather than leaving that to chance overlap of independent gaps.
+    Returns None (no forced blob) otherwise."""
+    if probability <= 0.0 or rng.uniform(0.0, 1.0) >= probability:
+        return None
+    cx = rng.uniform(width * 0.3, width * 0.7)
+    cy = rng.uniform(height * 0.3, height * 0.7)
+    r = 0.22 * min(width, height)
+    return (cx, cy, r)
+
+
+def _stamp_forced_gap(grid: np.ndarray, forced_blob) -> np.ndarray:
+    if forced_blob is None:
+        return grid
+    cx, cy, r = forced_blob
+    h, w = grid.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    grid = grid.copy()
+    grid[(xx - cx) ** 2 + (yy - cy) ** 2 <= r ** 2] = np.nan
+    return grid
 
 
 def run_worker(args: argparse.Namespace) -> None:
@@ -162,24 +190,33 @@ def run_worker(args: argparse.Namespace) -> None:
     push = ctx.socket(zmq.PUSH)
     push.connect(args.engine_endpoint)
 
+    force_synthetic = args.source == "synthetic"
+    rng = np.random.default_rng()
+
     with ThreadPoolExecutor(max_workers=args.overpasses) as pool:
         while True:
-            sources = _resolve_overpass_sources(args.overpasses, args.lat0, args.lon0)
+            sources = (
+                [OverpassSource(source_id=k, time_selector="last", day_offset=0) for k in range(args.overpasses)]
+                if force_synthetic
+                else _resolve_overpass_sources(args.overpasses, args.lat0, args.lon0)
+            )
             futures = [
                 pool.submit(_fetch_one_overpass, s, args.lat0, args.lat1, args.lon0, args.lon1, args.width,
-                            args.height)
+                            args.height, force_synthetic)
                 for s in sources
             ]
             results = [f.result() for f in futures]
 
-            overpass_grids = [grid for grid, _source in results]
+            forced_blob = _maybe_persistent_storm(args.width, args.height, rng, args.persistent_storm_probability)
+            overpass_grids = [_stamp_forced_gap(grid, forced_blob) for grid, _kind in results]
             source_ids = [s.source_id for s in sources]
             live_count = sum(1 for _grid, kind in results if kind == "live")
 
             parts = pack_scene(args.width, args.height, overpass_grids, source_ids, time.time())
             push.send_multipart(parts)
             print(f"[ingestion_worker] sent scene ({live_count}/{args.overpasses} overpasses live, "
-                  f"{args.overpasses - live_count} synthetic)")
+                  f"{args.overpasses - live_count} synthetic"
+                  f"{', persistent storm forced' if forced_blob else ''})")
 
             time.sleep(args.interval)
 
@@ -205,6 +242,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--height", type=int, default=64)
     p.add_argument("--overpasses", type=int, default=4)
     p.add_argument("--interval", type=float, default=20.0, help="seconds between scenes")
+    p.add_argument("--source", choices=["auto", "synthetic"], default="auto",
+                    help="auto: try live per-overpass, fall back individually; synthetic: skip the network entirely")
+    p.add_argument("--persistent-storm-probability", type=float, default=0.0,
+                    help="probability per scene of forcing one identically-placed cloud gap across every overpass")
     p.add_argument("--lat0", type=float, default=-37.0)
     p.add_argument("--lat1", type=float, default=-35.0)
     p.add_argument("--lon0", type=float, default=20.0)
