@@ -8,6 +8,8 @@ as a high-performance C++ backend, fed by either a local synthetic
 simulator or a live/hybrid Python ingestion worker, streaming to a live
 Python telemetry dashboard over ZeroMQ.
 
+![Live Execution showing 1.3 GB/s throughput](assets/demo.jpg)
+
 ```
 09respaper/
 ├── CMakeLists.txt              C++17 build (needs libzmq3-dev + cppzmq-dev)
